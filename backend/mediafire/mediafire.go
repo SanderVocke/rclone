@@ -17,8 +17,8 @@ import (
     "github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/rest"
-
 	"github.com/rclone/rclone/backend/mediafire/api"
+	"github.com/rclone/rclone/fs/config/configmap"
 )
 
 // FIXME implement
@@ -32,8 +32,8 @@ const (
 	rootID                      = "0" // ID of root folder is always this
 	rootURL                     = "https://www.mediafire.com/api/1.5/user/get_session_token.php"
 	//listChunks                  = 1000     // chunk size to read directory listings
-	//minUploadCutoff             = 50000000 // upload cutoff can be no lower than this
-	//defaultUploadCutoff         = 50 * 1024 * 1024
+	minUploadCutoff             = 50000000 // upload cutoff can be no lower than this
+	defaultUploadCutoff         = 50 * 1024 * 1024
 )
 
 // Globals
@@ -44,6 +44,7 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
+	UploadCutoff  fs.SizeSuffix `config:"upload_cutoff"` // FIXME is this needed?
 }
 
 // Fs represents a remote box
@@ -81,7 +82,7 @@ func computeSignature(email_or_ekey, password, appid, apikey string) (output str
 		return "", err
 	}
 
-	n, err := io.Copy(mh, bytes.NewBuffer([]byte(combined)))
+	_, err = io.Copy(mh, bytes.NewBuffer([]byte(combined)))
 	if err != nil {
 		return "", err
 	}
@@ -357,7 +358,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
-	return nil // FIXME
+	return time.Since(time.Unix(0,0)) // FIXME
 }
 
 // Copy src to this remote using server side copy operations.
@@ -509,7 +510,7 @@ func (f *Fs) DirCacheFlush() {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	return nil // FIXME: SHA256 support
+	return hash.Set(hash.SHA1) // FIXME: SHA256 support
 }
 
 // ------------------------------------------------------------
@@ -605,8 +606,8 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
-	o.fs.tokenRenewer.Start()
-	defer o.fs.tokenRenewer.Stop()
+	// o.fs.tokenRenewer.Start()
+	// defer o.fs.tokenRenewer.Stop() // FIXME
 
 	size := src.Size()
 	modTime := src.ModTime(ctx)
