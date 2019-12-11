@@ -24,6 +24,7 @@ TestSftp:
 TestSwift:
 TestWebdav:
 TestYandex:
+TestMediaFire:
 "
 
 # TestOss:

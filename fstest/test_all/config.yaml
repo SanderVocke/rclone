@@ -161,6 +161,9 @@ backends:
  - backend:  "box"
    remote:   "TestBox:"
    fastlist: false
+ - backend:  "mediafire"
+   remote:   "TestMediaFire:"
+   fastlist: false
  - backend:  "fichier"
    remote:   "TestFichier:"
    fastlist: false

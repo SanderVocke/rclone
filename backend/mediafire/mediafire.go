@@ -2,6 +2,7 @@ package mediafire
 
 import (
 	// FIXME remove unneeded
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -9,53 +10,68 @@ import (
 	"path"
 	"strings"
 	"time"
-	"bytes"
 
 	"github.com/pkg/errors"
 
-	"github.com/rclone/rclone/fs"
-    "github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/lib/dircache"
-	"github.com/rclone/rclone/lib/rest"
 	"github.com/rclone/rclone/backend/mediafire/api"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/rest"
 )
 
 // FIXME implement
 // const enc = encodings.MediaFire
 
 const (
-	rcloneAppID                 = "?"
-	minSleep                    = 10 * time.Millisecond
-	maxSleep                    = 2 * time.Second
-	decayConstant               = 2   // bigger for slower decay, exponential
-	rootID                      = "0" // ID of root folder is always this
-	rootURL                     = "https://www.mediafire.com/api/1.5/user/get_session_token.php"
+	rcloneAppID   = "?"
+	minSleep      = 10 * time.Millisecond
+	maxSleep      = 2 * time.Second
+	decayConstant = 2   // bigger for slower decay, exponential
+	rootID        = "0" // ID of root folder is always this
+	rootURL       = "https://www.mediafire.com/api/1.5/user/get_session_token.php"
 	//listChunks                  = 1000     // chunk size to read directory listings
-	minUploadCutoff             = 50000000 // upload cutoff can be no lower than this
-	defaultUploadCutoff         = 50 * 1024 * 1024
+	minUploadCutoff     = 50000000 // upload cutoff can be no lower than this
+	defaultUploadCutoff = 50 * 1024 * 1024
 )
 
 // Globals
 
 // Register with Fs
 func init() {
+	fs.Register(&fs.RegInfo{
+		Name:        "mediafire",
+		Description: "MediaFire",
+		NewFs:       NewFs,
+		Config: func(name string, m configmap.Mapper) {
+		},
+		Options: []fs.Option{{
+			Name:     "upload_cutoff",
+			Help:     "Cutoff for switching to multipart upload (>= 50MB).",
+			Default:  fs.SizeSuffix(defaultUploadCutoff),
+			Advanced: true,
+		}},
+	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	UploadCutoff  fs.SizeSuffix `config:"upload_cutoff"` // FIXME is this needed?
+	UploadCutoff fs.SizeSuffix `config:"upload_cutoff"` // FIXME is this needed?
 }
 
 // Fs represents a remote box
 type Fs struct {
-	name         string                // name of this remote
-	root         string                // the path we are working on
-	opt          Options               // parsed options
-	features     *fs.Features          // optional features
-	srv          *rest.Client          // the connection to the one drive server
-	dirCache     *dircache.DirCache    // Map of directory path to directory id
-	pacer        *fs.Pacer             // pacer for API calls
+	name     string             // name of this remote
+	root     string             // the path we are working on
+	opt      Options            // parsed options
+	features *fs.Features       // optional features
+	srv      *rest.Client       // the connection to the one drive server
+	dirCache *dircache.DirCache // Map of directory path to directory id
+	pacer    *fs.Pacer          // pacer for API calls
 }
 
 // Object describes a box object
@@ -147,7 +163,81 @@ func errorHandler(resp *http.Response) error {
 
 // NewFs constructs an Fs from the path, container:path
 func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	return nil, errors.New("not implemented") // FIXME
+	ctx := context.Background()
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	if opt.UploadCutoff < minUploadCutoff {
+		return nil, errors.Errorf("mediafire: upload cutoff (%v) must be greater than equal to %v", opt.UploadCutoff, fs.SizeSuffix(minUploadCutoff))
+	}
+
+	root = parsePath(root)
+	// oAuthClient, ts, err := oauthutil.NewClient(name, m, oauthConfig)
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "failed to configure Box")
+	// }
+	// FIXME: do authentication
+	baseClient := fshttp.NewClient(fs.Config)
+
+	f := &Fs{
+		name:  name,
+		root:  root,
+		opt:   *opt,
+		srv:   rest.NewClient(baseClient).SetRoot(rootURL),
+		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	// FIXME check these features
+	f.features = (&fs.Features{
+		CaseInsensitive:         false,
+		CanHaveEmptyDirectories: false,
+	}).Fill(f)
+	f.srv.SetErrorHandler(errorHandler)
+
+	// Renew the token in the background
+	// f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, func() error {
+	// 	_, err := f.readMetaDataForPath(ctx, "")
+	// 	return err
+	// })
+
+	// Get rootID
+	f.dirCache = dircache.New(root, rootID, f)
+
+	// Find the current root
+	err = f.dirCache.FindRoot(ctx, false)
+	if err != nil {
+		// Assume it is a file
+		newRoot, remote := dircache.SplitPath(root)
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
+		tempF.root = newRoot
+		// Make new Fs which is the parent
+		err = tempF.dirCache.FindRoot(ctx, false)
+		if err != nil {
+			// No root so return old f
+			return f, nil
+		}
+		_, err := tempF.newObjectWithInfo(ctx, remote, nil)
+		if err != nil {
+			if err == fs.ErrorObjectNotFound {
+				// File doesn't exist so return old f
+				return f, nil
+			}
+			return nil, err
+		}
+		f.features.Fill(&tempF)
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/rclone/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
+		// return an error with an fs which points to the parent
+		return f, fs.ErrorIsFile
+	}
+	return f, nil
 }
 
 // rootSlash returns root with a slash on if it is empty, otherwise empty string
@@ -358,7 +448,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
-	return time.Since(time.Unix(0,0)) // FIXME
+	return time.Since(time.Unix(0, 0)) // FIXME
 }
 
 // Copy src to this remote using server side copy operations.
@@ -571,7 +661,7 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 
 // setModTime sets the modification time of the local fs object
 func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, error) {
-	return nil, errors.New( "not implemented" )
+	return nil, errors.New("not implemented")
 }
 
 // SetModTime sets the modification time of the local fs object
